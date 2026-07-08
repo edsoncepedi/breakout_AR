@@ -1,1 +1,7 @@
 venv/
+__pycache__/
+breakout/__pycache__/
+breakout/besttime.txt
+fruit_ninja/__pycache__/
+fruit_ninja/bestscore.txt
+homography.npy
