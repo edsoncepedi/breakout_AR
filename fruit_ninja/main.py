@@ -27,9 +27,14 @@ Assets opcionais (mesmos nomes do ai-fruit-ninja original):
   o jogo cai automaticamente pra circulos coloridos -- funciona sem
   nenhum asset, so fica menos bonito.
 
+  ./assets/vitoria.png  (imagem cheia, SEM precisar de alpha; opcional)
+  ./assets/vitoria.wav  (som tocado uma vez ao vencer; .ogg tambem funciona;
+                         opcional -- sem pygame ou sem o arquivo, fica mudo)
+
 Dependencias (Pi OS Bookworm 64-bit):
   sudo apt install -y python3-picamera2
   pip install mediapipe opencv-contrib-python numpy
+  pip install pygame   # opcional, so necessario p/ o som de vitoria
 
 Uso:
   python3 ar_fruit_ninja_projector.py
@@ -49,6 +54,12 @@ import numpy as np
 import mediapipe as mp
 from picamera2 import Picamera2
 
+try:
+    import pygame
+    _PYGAME_OK = True
+except ImportError:
+    _PYGAME_OK = False
+
 # ----------------------------- CONFIG -----------------------------
 GAME_W, GAME_H = 1280, 720
 CAM_W, CAM_H = 640, 480
@@ -58,7 +69,7 @@ WINDOW = "game"
 ASSET_DIR = "assets"
 BEST_SCORE_FILE = "bestscore.txt"
 
-TARGET_FPS = 30
+TARGET_FPS = 60
 GESTURE_HOLD_S = 0.6
 BOUNDS_MARGIN = 25
 
@@ -67,6 +78,10 @@ GRAVITY = 0.35              # px/frame^2 (mesma escala do Breakout)
 SPAWN_MIN_S, SPAWN_MAX_S = 0.7, 1.3
 BOMB_CHANCE = 0.15
 LIVES_START = 3
+WIN_SCORE = 10                    # pontos para vencer e encerrar o jogo
+WIN_IMAGE_FILE = "vitoria.png"     # opcional: coloque em ./assets/vitoria.png
+WIN_SOUND_FILE = "vitoria.wav"     # opcional: coloque em ./assets/vitoria.wav (ou .ogg)
+WIN_SOUND_FILE = "vitoria.wav"     # opcional: coloque em ./assets/vitoria.wav (ou .ogg)
 SLICE_TOLERANCE = 10        # folga (px) alem do raio da fruta pra contar corte
 MIN_SLICE_SPEED = 4.0       # px/frame minimo entre frames p/ contar como "corte"
                              # (evita fatiar so encostando parado)
@@ -263,6 +278,62 @@ class HandTracker(threading.Thread):
         self.running = False
 
 # ------------------------- ASSETS (opcional) -----------------------
+def init_audio():
+    """Inicializa o mixer de audio. Retorna True se deu certo, False se
+    pygame nao estiver instalado ou nao houver saida de audio disponivel
+    (o jogo continua funcionando normalmente sem som nesse caso)."""
+    if not _PYGAME_OK:
+        print("pygame nao instalado -- rodando sem audio (pip install pygame p/ habilitar)")
+        return False
+    try:
+        pygame.mixer.init()
+        return True
+    except Exception as e:
+        print("Nao foi possivel iniciar o audio -- rodando sem som:", e)
+        return False
+
+def load_win_sound(audio_ok):
+    """Carrega o som de vitoria, se o audio estiver disponivel e o arquivo existir."""
+    if not audio_ok:
+        return None
+    path = os.path.join(ASSET_DIR, WIN_SOUND_FILE)
+    if not os.path.exists(path):
+        print(f"Sem som de vitoria em {path} -- vitoria fica silenciosa.")
+        return None
+    try:
+        return pygame.mixer.Sound(path)
+    except Exception as e:
+        print(f"Nao foi possivel carregar {path}:", e)
+        return None
+
+def load_win_image():
+    """Carrega a imagem de vitoria opcional (nao precisa de canal alpha).
+    Se nao existir, retorna None e o jogo usa uma tela de texto no lugar."""
+    path = os.path.join(ASSET_DIR, WIN_IMAGE_FILE)
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    # Redimensiona mantendo proporcao pra caber no canvas com uma margem
+    max_w, max_h = int(GAME_W * 0.7), int(GAME_H * 0.6)
+    h, w = img.shape[:2]
+    scale = min(max_w / w, max_h / h)
+    new_size = (int(w * scale), int(h * scale))
+    return cv2.resize(img, new_size)
+
+def draw_centered_image(canvas, img, y_offset=0):
+    """Desenha img (sem alpha) centralizado no canvas, deslocado verticalmente
+    por y_offset (px, positivo = mais pra baixo)."""
+    h, w = img.shape[:2]
+    x0 = (GAME_W - w) // 2
+    y0 = (GAME_H - h) // 2 + y_offset
+    x1, y1 = x0 + w, y0 + h
+    # clipping simples (nao deve ser necessario com o resize acima, mas por seguranca)
+    x0c, y0c = max(x0, 0), max(y0, 0)
+    x1c, y1c = min(x1, GAME_W), min(y1, GAME_H)
+    if x1c <= x0c or y1c <= y0c:
+        return
+    canvas[y0c:y1c, x0c:x1c] = img[y0c - y0:y1c - y0, x0c - x0:x1c - x0]
+
 def load_assets():
     """Carrega PNGs com alpha se existirem; senao retorna dict vazio
     (o jogo cai pra circulos coloridos automaticamente).
@@ -361,12 +432,13 @@ def _centered_text(canvas, text, y, scale, color, thick):
     cv2.putText(canvas, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick, cv2.LINE_AA)
     return th
 
-def _hold_bar(canvas, progress):
+def _hold_bar(canvas, progress, y0=None):
     if progress <= 0:
         return
     bw, bh = 400, 22
     x0 = (GAME_W - bw) // 2
-    y0 = GAME_H // 2 + 110
+    if y0 is None:
+        y0 = GAME_H // 2 + 110
     cv2.rectangle(canvas, (x0, y0), (x0 + bw, y0 + bh), (120, 120, 120), 2)
     fill = int(bw * min(progress, 1.0))
     cv2.rectangle(canvas, (x0, y0), (x0 + fill, y0 + bh), (0, 255, 0), -1)
@@ -385,6 +457,24 @@ def game_over_screen(canvas, progress, score, is_new_record):
         _centered_text(canvas, "NOVO RECORDE!", y + 30, 1.0, (0, 215, 255), 2)
     _centered_text(canvas, "Mao aberta para jogar de novo", y + 75, 1, (255, 255, 255), 2)
     _hold_bar(canvas, progress)
+
+def win_screen(canvas, progress, score, is_new_record, win_image):
+    if win_image is not None:
+        draw_centered_image(canvas, win_image, y_offset=-60)
+        _centered_text(canvas, f"Voce venceu! Pontos: {score}",
+                       GAME_H - 110, 1.0, (255, 255, 255), 2)
+        if is_new_record:
+            _centered_text(canvas, "NOVO RECORDE!", GAME_H - 75, 1.0, (0, 215, 255), 2)
+        _centered_text(canvas, "Mao aberta para jogar de novo", GAME_H - 40, 0.9, (200, 200, 200), 2)
+        _hold_bar(canvas, progress, y0=GAME_H - 28)
+    else:
+        y = GAME_H // 2
+        _centered_text(canvas, "Voce Venceu!", y - 60, 2, (0, 255, 0), 3)
+        _centered_text(canvas, f"Pontos: {score}", y - 10, 1.2, (255, 255, 255), 2)
+        if is_new_record:
+            _centered_text(canvas, "NOVO RECORDE!", y + 30, 1.0, (0, 215, 255), 2)
+        _centered_text(canvas, "Mao aberta para jogar de novo", y + 75, 1, (255, 255, 255), 2)
+        _hold_bar(canvas, progress)
 
 def load_best_score():
     try:
@@ -444,6 +534,14 @@ def main():
     score = 0
     lives = LIVES_START
     is_new_record = False
+    is_winner = False
+    win_image = load_win_image()
+    if win_image is not None:
+        print(f"Imagem de vitoria carregada de {ASSET_DIR}/{WIN_IMAGE_FILE}")
+    else:
+        print(f"Sem imagem de vitoria em {ASSET_DIR}/{WIN_IMAGE_FILE} -- usando tela de texto.")
+    audio_ok = init_audio()
+    win_sound = load_win_sound(audio_ok)
     fruits = []
     next_spawn_at = 0.0
     gesture_since = None
@@ -476,6 +574,7 @@ def main():
                     reset_game()
                     state = "playing"
                     is_new_record = False
+                    is_winner = False
                     gesture_since = None
             else:
                 gesture_since = None
@@ -490,7 +589,10 @@ def main():
             start_screen(canvas, gesture_progress())
 
         elif state == "over":
-            game_over_screen(canvas, gesture_progress(), score, is_new_record)
+            if is_winner:
+                win_screen(canvas, gesture_progress(), score, is_new_record, win_image)
+            else:
+                game_over_screen(canvas, gesture_progress(), score, is_new_record)
 
         else:  # playing
             now = time.time()
@@ -511,6 +613,7 @@ def main():
                     fruits.remove(fruit)
                     if fruit.kind == "bomb":
                         state = "over"
+                        is_winner = False
                         if best_score is None or score > best_score:
                             best_score = score
                             save_best_score(best_score)
@@ -519,6 +622,17 @@ def main():
                             is_new_record = False
                     else:
                         score += FRUIT_KINDS[fruit.kind]["points"]
+                        if score >= WIN_SCORE:
+                            state = "over"
+                            is_winner = True
+                            if win_sound is not None:
+                                win_sound.play()
+                            if best_score is None or score > best_score:
+                                best_score = score
+                                save_best_score(best_score)
+                                is_new_record = True
+                            else:
+                                is_new_record = False
                     continue
 
                 # fruta caiu sem ser cortada
@@ -528,6 +642,7 @@ def main():
                         lives -= 1
                         if lives <= 0:
                             state = "over"
+                            is_winner = False
                             if best_score is None or score > best_score:
                                 best_score = score
                                 save_best_score(best_score)
@@ -554,6 +669,7 @@ def main():
             reset_game()
             state, gesture_since = "playing", None
             is_new_record = False
+            is_winner = False
 
         dt = time.time() - t0
         if dt < target_dt:
